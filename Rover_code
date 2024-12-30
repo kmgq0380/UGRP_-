@@ -1,0 +1,182 @@
+#include "sbus.h"
+
+
+/* SBUS object, reading SBUS */
+bfs::SbusRx sbus_rx(&Serial2);
+/* SBUS data */
+bfs::SbusData data;
+
+
+// 주제어 칩 MEGA2560 칩
+// 주제어 칩 MEGA2560 칩 다운로드 칩 CH340 드라이버 설치 필요
+// MeBigDiv 검은색 컨트롤러와 DWS300 검은색 모터 드라이버 블루투스 프로그램
+// MeBigDiv 검은색 컨트롤러 및 DWS300 검은색 모터 드라이버 블루투스 프로그램
+
+
+// 모터 핀 정의
+#define PWMA 4     // A 전동기 속도
+#define DIRA1 A4
+#define DIRA2 A5    // A 전동기 방향
+
+#define PWMB 6      // B 전동기 속도
+#define DIRB1 43
+#define DIRB2 42    // B 전동기 방향
+
+#define PWMC 11     // C 전동기 속도
+#define DIRC1 34
+#define DIRC2 35    // C 전동기 방향
+
+#define PWMD 7      // D 전동기 속도
+#define DIRD1 37
+#define DIRD2 36    // D 전동기 방향
+
+// 모터 제어 매크로 정의
+#define MOTORA_FORWARD(pwm)    do{digitalWrite(DIRA1,HIGH); digitalWrite(DIRA2,LOW); analogWrite(PWMA,pwm);}while(0)
+#define MOTORA_STOP()          do{digitalWrite(DIRA1,LOW); digitalWrite(DIRA2,LOW); analogWrite(PWMA,0);}while(0)
+#define MOTORA_BACKOFF(pwm)    do{digitalWrite(DIRA1,LOW); digitalWrite(DIRA2,HIGH); analogWrite(PWMA,pwm);}while(0)
+
+#define MOTORB_FORWARD(pwm)    do{digitalWrite(DIRB1,LOW); digitalWrite(DIRB2,HIGH); analogWrite(PWMB,pwm);}while(0)
+#define MOTORB_STOP()          do{digitalWrite(DIRB1,LOW); digitalWrite(DIRB2,LOW); analogWrite(PWMB,0);}while(0)
+#define MOTORB_BACKOFF(pwm)    do{digitalWrite(DIRB1,HIGH); digitalWrite(DIRB2,LOW); analogWrite(PWMB,pwm);}while(0)
+
+#define MOTORC_FORWARD(pwm)    do{digitalWrite(DIRC1,HIGH); digitalWrite(DIRC2,LOW); analogWrite(PWMC,pwm);}while(0)
+#define MOTORC_STOP()          do{digitalWrite(DIRC1,LOW); digitalWrite(DIRC2,LOW); analogWrite(PWMC,0);}while(0)
+#define MOTORC_BACKOFF(pwm)    do{digitalWrite(DIRC1,LOW); digitalWrite(DIRC2,HIGH); analogWrite(PWMC,pwm);}while(0)
+
+#define MOTORD_FORWARD(pwm)    do{digitalWrite(DIRD1,LOW); digitalWrite(DIRD2,HIGH); analogWrite(PWMD,pwm);}while(0)
+#define MOTORD_STOP()          do{digitalWrite(DIRD1,LOW); digitalWrite(DIRD2,LOW); analogWrite(PWMD,0);}while(0)
+#define MOTORD_BACKOFF(pwm)    do{digitalWrite(DIRD1,HIGH); digitalWrite(DIRD2,LOW); analogWrite(PWMD,pwm);}while(0)
+
+#define SERIAL Serial
+
+#define MAX_PWM   100
+#define MIN_PWM   0
+int Motor_PWM = 0; //초기 모터 속도 설정
+
+// 로봇의 기하학적 특성
+const float L = 20.0; // 중심에서 앞뒤 방향 휠까지의 거리 
+const float W = 23.0; // 중심에서 좌우 방향 휠까지의 거리 
+
+void STOP() {
+  MOTORA_STOP();
+  MOTORB_STOP();
+  MOTORC_STOP();
+  MOTORD_STOP();
+}
+
+// 각 휠에 대한 속도를 계산하는 함수
+void calculateWheelSpeeds(float V_x, float V_y, float omega, int &V_FL, int &V_FR, int &V_RL, int &V_RR) {
+  V_FL = V_y + V_x - omega/30 * (L + W);
+  V_FR = V_y - V_x + omega/30 * (L + W);
+  V_RL = V_y - V_x - omega/30 * (L + W);
+  V_RR = V_y + V_x + omega/30 * (L + W);
+}
+
+// 이동 함수 (병진 운동 및 회전)
+void move(float V_x, float V_y, float omega) {
+  int V_FL, V_FR, V_RL, V_RR;
+  calculateWheelSpeeds(V_x, V_y, omega, V_FL, V_FR, V_RL, V_RR);
+
+  if (V_FL >= 30) MOTORA_FORWARD(abs(V_FL)-30); else if (V_FL < -30) MOTORA_BACKOFF(abs(V_FL)-30); else MOTORA_STOP();
+  if (V_FR >= 30) MOTORB_FORWARD(abs(V_FR)-30); else if (V_FR < -30) MOTORB_BACKOFF(abs(V_FR)-30); else MOTORB_STOP();
+  if (V_RL >= 30) MOTORC_FORWARD(abs(V_RL)-30); else if (V_RL < -30) MOTORC_BACKOFF(abs(V_RL)-30); else MOTORC_STOP();
+  if (V_RR >= 30) MOTORD_FORWARD(abs(V_RR)-30); else if (V_RR < -30) MOTORD_BACKOFF(abs(V_RR)-30); else MOTORD_STOP();
+}
+
+void handle_sbus(bfs::SbusData buf) {
+  int16_t value1 = buf.ch[1];
+  int16_t value0 = buf.ch[0];
+  int16_t value3 = buf.ch[3];
+  int16_t center = 992;
+  int16_t value_1 = value1 - center;
+  int16_t value_0 = value0 - center;
+  int16_t value_3 = value3 - center;
+  int16_t threshold = 200;
+  
+  int map_value1 = map(value_1, -815, 815, -MAX_PWM, MAX_PWM);
+  int map_value0 = map(value_0, -815, 815, -MAX_PWM, MAX_PWM);
+  int map_value3 = map(value_3, -815, 815, -MAX_PWM, MAX_PWM);
+
+  // 디버깅을 위한 출력
+  Serial.print("value1: "); Serial.print(value1);
+  Serial.print(" value_1: "); Serial.print(value_1);
+  Serial.print(" map_value1: "); Serial.println(map_value1);
+
+  Serial.print("value0: "); Serial.print(value0);
+  Serial.print(" value_0: "); Serial.print(value_0);
+  Serial.print(" map_value0: "); Serial.println(map_value0);
+
+  Serial.print("value3: "); Serial.print(value3);
+  Serial.print(" value_3: "); Serial.print(value_3);
+  Serial.print(" map_value3: "); Serial.println(map_value3);
+
+  // RC카 작동
+  
+  move(-map_value0, map_value1, -map_value3);
+
+  
+}
+
+void UART_Control() {
+  char Uart_Date;
+  if (SERIAL.available()) {
+    Uart_Date = SERIAL.read();
+  }
+
+  switch (Uart_Date) {
+    case 'A':  move(0, Motor_PWM, 0);        break; // 전진
+    case 'B':  move(0, 0, Motor_PWM/4);        break; // 회전
+    case 'G':  move(Motor_PWM, 0, 0);        break; // 오른쪽 이동
+    case 'D':  move(-Motor_PWM, 0, 0);       break; // 왼쪽 이동
+    case 'E':  move(0, -Motor_PWM, 0);       break; // 후진
+    case 'F':  move(0, 0, -Motor_PWM/4);       break; // 반시계 방향 회전
+    case 'C':  STOP();                       break; // 정지
+    case 'L':  Motor_PWM = 70;               break; // 낮은 속도
+    case 'M':  Motor_PWM = 30;               break; // 매우 낮은 속도
+  }
+}
+
+void IO_init() {
+  pinMode(PWMA, OUTPUT);
+  pinMode(DIRA1, OUTPUT); 
+  pinMode(DIRA2, OUTPUT);
+  pinMode(PWMB, OUTPUT);
+  pinMode(DIRB1, OUTPUT); 
+  pinMode(DIRB2, OUTPUT);
+  pinMode(PWMC, OUTPUT);
+  pinMode(DIRC1, OUTPUT); 
+  pinMode(DIRC2, OUTPUT);
+  pinMode(PWMD, OUTPUT);
+  pinMode(DIRD1, OUTPUT); 
+  pinMode(DIRD2, OUTPUT);
+  STOP();
+}
+
+void setup() {
+  SERIAL.begin(9600);
+  IO_init();
+  SERIAL.print("Start");
+  STOP();
+  delay(1500);
+  sbus_rx.Begin();
+}
+
+void loop() {
+  UART_Control();
+  
+  if (sbus_rx.Read()) {
+    Serial.println("SBUS data read"); // 디버깅 메시지
+    data = sbus_rx.data();
+    handle_sbus(data);
+    for (int8_t i = 0; i < data.NUM_CH; i++) {
+      Serial.print(data.ch[i]);
+      Serial.print("\t");
+    }
+    Serial.println();
+    Serial.print(data.lost_frame);
+    Serial.print("\t");
+    Serial.println(data.failsafe);
+  } else {
+    Serial.println("SBUS data not read"); // 디버깅 메시지
+  }
+}
