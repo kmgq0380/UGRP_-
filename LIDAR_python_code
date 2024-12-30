@@ -1,0 +1,239 @@
+import os
+import ydlidar
+import time
+import serial
+import threading
+import numpy as np
+from sklearn.cluster import DBSCAN
+
+RMAX = 32.0
+
+# 시리얼 포트 설정
+port = '/dev/ttyACM0'  # Windows의 경우 COM 포트, Linux의 경우 '/dev/ttyUSB0' 등
+baudrate = 512000
+ser = serial.Serial(port, baudrate)
+time.sleep(2)  # 포트가 열릴 때까지 잠시 대기
+
+result_data = [[0] * 64 for _ in range(8)]
+
+# 라이다 초기화
+port = "/dev/ttyUSB0"
+laser = ydlidar.CYdLidar()
+laser.setlidaropt(ydlidar.LidarPropSerialPort, port)
+laser.setlidaropt(ydlidar.LidarPropSerialBaudrate, 512000)
+laser.setlidaropt(ydlidar.LidarPropLidarType, ydlidar.TYPE_TOF)
+laser.setlidaropt(ydlidar.LidarPropDeviceType, ydlidar.YDLIDAR_TYPE_SERIAL)
+laser.setlidaropt(ydlidar.LidarPropScanFrequency, 10.0)
+laser.setlidaropt(ydlidar.LidarPropSampleRate, 20)
+laser.setlidaropt(ydlidar.LidarPropSingleChannel, False)
+laser.setlidaropt(ydlidar.LidarPropMaxAngle, 180.0)
+laser.setlidaropt(ydlidar.LidarPropMinAngle, -180.0)
+laser.setlidaropt(ydlidar.LidarPropMaxRange, 32.0)
+laser.setlidaropt(ydlidar.LidarPropMinRange, 0.01)
+scan = ydlidar.LaserScan()
+
+def normalize_angle(angle):
+    """ -180도에서 180도 범위로 각도를 정규화하는 함수 """
+    while angle <= -180:
+        angle += 360
+    while angle > 180:
+        angle -= 360
+    return angle
+
+def read_serial():
+    """ 시리얼 포트에서 데이터를 읽는 함수 """
+    global result_data
+    try:
+        while True:
+            if ser.in_waiting > 0:  # 데이터가 들어올 때까지 대기
+                line = ser.readline().decode('utf-8').rstrip()  # 데이터 읽기
+                
+                result_data = line.split()
+                result_data = [result_data[i:i + 64] for i in range(0, len(result_data), 64)]
+                #print(f'Serial: {result_data}')  # 출력하기
+    except KeyboardInterrupt:
+        print("시리얼 읽기를 종료합니다.")
+    finally:
+        ser.close()  # 포트 닫기
+
+def process_lidar_data():
+    global result_data
+    r = laser.doProcessSimple(scan)
+    if r:
+        angle = []
+        ran = []
+        intensity = []
+
+        for point in scan.points:
+            angle.append(point.angle)
+            ran.append(point.range)
+            intensity.append(point.intensity)
+
+        x = np.array(ran) * np.cos(angle)
+        y = np.array(ran) * np.sin(angle)
+
+        data = np.vstack((x, y)).T
+
+        db = DBSCAN(eps=0.2, min_samples=5).fit(data)
+        labels = db.labels_
+
+        n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+
+        closest_points = {i: {'angle': None, 'distance': float('inf')} for i in set(labels) if i != -1}
+        cluster_means = {i: {'x_mean': 0, 'y_mean': 0, 'count': 0} for i in set(labels) if i != -1}
+
+        # 클러스터별 최단 거리 및 평균 각도 계산
+        for i, point in enumerate(scan.points):
+            cluster_label = labels[i]
+            if cluster_label != -1:
+                if point.range < closest_points[cluster_label]['distance']:
+                    closest_points[cluster_label]['distance'] = point.range
+                    closest_points[cluster_label]['angle'] = np.degrees(point.angle)
+
+                # 최단 거리 기준 +0.2m 이내의 포인트만 평균 각도 계산에 포함
+                if point.range <= closest_points[cluster_label]['distance'] + 0.2:
+                    cluster_means[cluster_label]['x_mean'] += x[i]
+                    cluster_means[cluster_label]['y_mean'] += y[i]
+                    cluster_means[cluster_label]['count'] += 1
+
+        cluster_results = []
+
+        for k in cluster_means.keys():
+            if cluster_means[k]['count'] > 0:
+                x_avg = cluster_means[k]['x_mean'] / cluster_means[k]['count']
+                y_avg = cluster_means[k]['y_mean'] / cluster_means[k]['count']
+                angle_avg = np.arctan2(y_avg, x_avg)
+                cluster_angle_avg = np.degrees(angle_avg)
+
+                # 최솟값과 최댓값 계산
+                adjusted_angles = [normalize_angle(np.degrees(point.angle) - (closest_points[k]['angle'] - 90))
+                                   for i, point in enumerate(scan.points) 
+                                   if labels[i] == k and 
+                                   point.range <= closest_points[k]['distance'] + 0.2]
+
+                if adjusted_angles:
+                    min_angle = min(adjusted_angles)
+                    max_angle = max(adjusted_angles)
+
+                    # 최종 최소, 최대값 계산
+                    final_min = normalize_angle(min_angle + (closest_points[k]['angle'] - 90))
+                    final_max = normalize_angle(max_angle + (closest_points[k]['angle'] - 90))
+
+                    # 결과 저장
+                    cluster_results.append({
+                        'cluster': k,
+                        'closest_angle': closest_points[k]['angle'],
+                        'closest_distance': closest_points[k]['distance'],
+                        'average_angle': cluster_angle_avg,
+                        'final_min_angle': final_min,
+                        'final_max_angle': final_max
+                    })
+        
+        # 결과 출력
+        for result in cluster_results:
+            print(f"Cluster {result['cluster']}:")
+            print(f"  Closest Point - Angle: {result['closest_angle']:.2f}°, Distance: {result['closest_distance']:.2f}")
+            print(f"  Average Angle: {result['average_angle']:.2f}°")
+            print(f"  Final Min Angle: {result['final_min_angle']:.2f}°, Final Max Angle: {result['final_max_angle']:.2f}°")
+            syncro = 122.07
+            sensor_num = -1
+            sensor_num_two = -1
+            if (syncro <= result['closest_angle'] < syncro + 45):
+                sensor_num = 0
+                if (syncro <= result['closest_angle'] < syncro + 5):
+                    sensor_num_two = 1
+                elif (syncro + 40 <= result['closest_angle'] < syncro + 45):
+                    sensor_num_two = 7
+            elif (syncro - 45 <= result['closest_angle'] < syncro):
+                sensor_num = 1
+                if (syncro - 45 <= result['closest_angle'] < syncro - 40):
+                    sensor_num_two = 2
+                elif (syncro - 5 <= result['closest_angle'] < syncro):
+                    sensor_num_two = 0
+            elif (syncro - 90 <= result['closest_angle'] < syncro - 45):
+                sensor_num = 2
+                if (syncro - 90 <= result['closest_angle'] < syncro - 85):
+                    sensor_num_two = 3
+                elif (syncro - 50 <= result['closest_angle'] < syncro - 45):
+                    sensor_num_two = 1
+            elif (syncro - 135 <= result['closest_angle'] < syncro - 90):
+                sensor_num = 3
+                if (syncro - 135 <= result['closest_angle'] < syncro - 130):
+                    sensor_num_two = 4
+                elif (syncro - 95 <= result['closest_angle'] < syncro - 90):
+                    sensor_num_two = 2
+            elif (syncro - 180 <= result['closest_angle'] < syncro - 135):
+                sensor_num = 4
+                if (syncro - 180 <= result['closest_angle'] < syncro - 175):
+                    sensor_num_two = 5
+                elif (syncro - 140 <= result['closest_angle'] < syncro - 135):
+                    sensor_num_two = 3
+            elif (syncro - 225 <= result['closest_angle'] < syncro - 180):
+                sensor_num = 5
+                if (syncro - 225 <= result['closest_angle'] < syncro - 220):
+                    sensor_num_two = 6
+                elif (syncro - 185 <= result['closest_angle'] < syncro - 180):
+                    sensor_num_two = 4
+            elif (syncro - 270 <= result['closest_angle'] < syncro - 225):
+                sensor_num = 6
+                if (syncro - 270 <= result['closest_angle'] < syncro - 265):
+                    sensor_num_two = 7
+                elif (syncro - 230 <= result['closest_angle'] < syncro - 225):
+                    sensor_num_two = 5
+            else:
+                sensor_num = 7
+                if (syncro + 45 <= result['closest_angle'] < syncro + 50):
+                    sensor_num_two = 0
+                elif (syncro - 275 <= result['closest_angle'] < syncro - 270):
+                    sensor_num_two = 6
+            
+            first_idx = 31
+            second_idx = 32
+            for i in range(64):
+                #print(result['closest_distance'] , ' /// ' , result_data[sensor_num][i])
+                if abs(float(result['closest_distance']) - float(result_data[sensor_num][i]) * 0.001) < 0.3:
+                    first_idx = i                
+                    break
+            for i in range(64):
+                if abs(float(result['closest_distance']) - float(result_data[sensor_num][63 - i]) * 0.001) < 0.3:
+                    second_idx = 63 - i
+                    break
+            row_low = ((first_idx // 8) * 45 / 8) - 22.5
+            row_high = ((second_idx // 8 + 1) * 45 / 8) - 22.5
+            if sensor_num_two != -1:
+                first_idx_two = 31
+                second_idx_two = 32
+                for i in range(64):
+                    if abs(float(result['closest_distance']) - float(result_data[sensor_num_two][i]) * 0.001) < 0.3:
+                        first_idx_two = i
+                        break
+                for i in range(64):
+                    if abs(float(result['closest_distance']) - float(result_data[sensor_num_two][63 - i]) * 0.001) < 0.3:
+                        second_idx_two = 63 - i
+                        break
+                row_low_two = ((first_idx_two // 8) * 45 / 8) - 22.5
+                row_high_two = ((second_idx_two // 8 + 1) * 45 / 8) - 22.5
+                
+                row_low = min(row_low, row_low_two)
+                row_high = max(row_high, row_high_two)
+                
+            print(f"  Low angle: {row_low:.2f}°, High angle: {row_high:.2f}°")
+            print(f"sensornum: {sensor_num}, sensornum2: {sensor_num_two}")
+        
+        print(f"Number of Clusters: {n_clusters}")
+
+# 시리얼 읽기를 스레드로 실행
+serial_thread = threading.Thread(target=read_serial)
+serial_thread.daemon = True
+serial_thread.start()
+
+# 라이다 초기화 및 데이터 처리 시작
+ret = laser.initialize()
+if ret:
+    ret = laser.turnOn()
+    if ret:
+        while True:
+            process_lidar_data()
+            time.sleep(0.1)  # 데이터 처리 주기
+    laser.turnOff()
+laser.disconnecting()
